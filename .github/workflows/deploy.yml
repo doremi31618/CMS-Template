@@ -1,0 +1,213 @@
+name: Deploy to GCP
+
+on:
+  push:
+    branches: [ main, staging ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GAR_LOCATION: us-central1
+  SERVICE_FRONTEND: cms-frontend
+  SERVICE_BACKEND: cms-backend
+  REGION: us-central1
+  DB_INSTANCE: cms-postgres
+  STORAGE_BUCKET: ${{ secrets.GCP_PROJECT_ID }}-cms-storage
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: |
+          frontend-app/package-lock.json
+          backend-app/package-lock.json
+
+    - name: Install frontend dependencies
+      run: |
+        cd frontend-app
+        npm ci
+
+    - name: Install backend dependencies
+      run: |
+        cd backend-app
+        npm ci
+
+    - name: Run frontend tests
+      run: |
+        cd frontend-app
+        npm run lint
+
+    - name: Run backend tests
+      run: |
+        cd backend-app
+        npm run lint
+        npm run typecheck
+
+  setup-infrastructure:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Google Auth
+      id: auth
+      uses: 'google-github-actions/auth@v2'
+      with:
+        credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+    - name: Set up Cloud SDK
+      uses: 'google-github-actions/setup-gcloud@v2'
+
+    - name: Enable required APIs
+      run: |
+        gcloud services enable run.googleapis.com
+        gcloud services enable sqladmin.googleapis.com
+        gcloud services enable storage.googleapis.com
+        gcloud services enable artifactregistry.googleapis.com
+        gcloud services enable cloudbuild.googleapis.com
+
+    - name: Create Artifact Registry repository
+      run: |
+        gcloud artifacts repositories create cms-images \
+          --repository-format=docker \
+          --location=$GAR_LOCATION \
+          --description="CMS Docker images" || true
+
+    - name: Create Cloud SQL instance (if not exists)
+      run: |
+        gcloud sql instances create $DB_INSTANCE \
+          --database-version=POSTGRES_15 \
+          --tier=db-f1-micro \
+          --region=$REGION \
+          --storage-type=SSD \
+          --storage-size=10GB \
+          --backup-start-time=03:00 \
+          --enable-bin-log || echo "Instance may already exist"
+
+    - name: Create database
+      run: |
+        gcloud sql databases create cms_production \
+          --instance=$DB_INSTANCE || echo "Database may already exist"
+
+    - name: Create storage bucket
+      run: |
+        gsutil mb -l $REGION gs://$STORAGE_BUCKET || echo "Bucket may already exist"
+        gsutil iam ch allUsers:objectViewer gs://$STORAGE_BUCKET
+
+  build-and-deploy:
+    needs: [test, setup-infrastructure]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Google Auth
+      id: auth
+      uses: 'google-github-actions/auth@v2'
+      with:
+        credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+    - name: Set up Cloud SDK
+      uses: 'google-github-actions/setup-gcloud@v2'
+
+    - name: Configure Docker to use gcloud as a credential helper
+      run: |
+        gcloud auth configure-docker $GAR_LOCATION-docker.pkg.dev
+
+    - name: Get DB connection name
+      id: db_connection
+      run: |
+        CONNECTION_NAME=$(gcloud sql instances describe $DB_INSTANCE --format="value(connectionName)")
+        echo "connection_name=$CONNECTION_NAME" >> $GITHUB_OUTPUT
+
+    - name: Build Frontend Image
+      run: |
+        docker build -t $GAR_LOCATION-docker.pkg.dev/$PROJECT_ID/cms-images/frontend:$GITHUB_SHA \
+          --build-arg NEXT_PUBLIC_API_URL=https://$SERVICE_BACKEND-${{ secrets.GCP_PROJECT_HASH }}-uc.a.run.app \
+          --build-arg NEXT_PUBLIC_STORAGE_BUCKET=$STORAGE_BUCKET \
+          -f frontend-app/Dockerfile.prod frontend-app/
+
+    - name: Build Backend Image
+      run: |
+        docker build -t $GAR_LOCATION-docker.pkg.dev/$PROJECT_ID/cms-images/backend:$GITHUB_SHA \
+          -f backend-app/Dockerfile.prod backend-app/
+
+    - name: Push Images
+      run: |
+        docker push $GAR_LOCATION-docker.pkg.dev/$PROJECT_ID/cms-images/frontend:$GITHUB_SHA
+        docker push $GAR_LOCATION-docker.pkg.dev/$PROJECT_ID/cms-images/backend:$GITHUB_SHA
+
+    - name: Deploy Backend to Cloud Run
+      run: |
+        gcloud run deploy $SERVICE_BACKEND \
+          --image $GAR_LOCATION-docker.pkg.dev/$PROJECT_ID/cms-images/backend:$GITHUB_SHA \
+          --region $REGION \
+          --platform managed \
+          --allow-unauthenticated \
+          --add-cloudsql-instances ${{ steps.db_connection.outputs.connection_name }} \
+          --set-env-vars NODE_ENV=production \
+          --set-env-vars HOST=0.0.0.0 \
+          --set-env-vars PORT=3333 \
+          --set-env-vars DB_HOST=/cloudsql/${{ steps.db_connection.outputs.connection_name }} \
+          --set-env-vars DB_DATABASE=cms_production \
+          --set-env-vars DB_USER=postgres \
+          --set-env-vars DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
+          --set-env-vars STORAGE_BUCKET=$STORAGE_BUCKET \
+          --set-env-vars GCP_PROJECT_ID=$PROJECT_ID \
+          --port 3333 \
+          --memory 1Gi \
+          --cpu 1
+
+    - name: Deploy Frontend to Cloud Run
+      run: |
+        gcloud run deploy $SERVICE_FRONTEND \
+          --image $GAR_LOCATION-docker.pkg.dev/$PROJECT_ID/cms-images/frontend:$GITHUB_SHA \
+          --region $REGION \
+          --platform managed \
+          --allow-unauthenticated \
+          --set-env-vars NODE_ENV=production \
+          --set-env-vars NEXT_PUBLIC_API_URL=https://$SERVICE_BACKEND-${{ secrets.GCP_PROJECT_HASH }}-uc.a.run.app \
+          --set-env-vars NEXT_PUBLIC_STORAGE_BUCKET=$STORAGE_BUCKET \
+          --port 3000 \
+          --memory 512Mi \
+          --cpu 1
+
+    - name: Run database migrations
+      run: |
+        gcloud run jobs create migrate-db \
+          --image $GAR_LOCATION-docker.pkg.dev/$PROJECT_ID/cms-images/backend:$GITHUB_SHA \
+          --region $REGION \
+          --add-cloudsql-instances ${{ steps.db_connection.outputs.connection_name }} \
+          --set-env-vars NODE_ENV=production \
+          --set-env-vars DB_HOST=/cloudsql/${{ steps.db_connection.outputs.connection_name }} \
+          --set-env-vars DB_DATABASE=cms_production \
+          --set-env-vars DB_USER=postgres \
+          --set-env-vars DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
+          --command=node \
+          --args=ace,migration:run \
+          --max-retries=3 \
+          --parallelism=1 \
+          --task-count=1 || true
+        
+        gcloud run jobs execute migrate-db --region $REGION --wait
+
+    - name: Show deployment URLs
+      run: |
+        echo "Frontend URL: $(gcloud run services describe $SERVICE_FRONTEND --region $REGION --format 'value(status.url)')"
+        echo "Backend URL: $(gcloud run services describe $SERVICE_BACKEND --region $REGION --format 'value(status.url)')"
+        echo "Database: ${{ steps.db_connection.outputs.connection_name }}"
+        echo "Storage Bucket: gs://$STORAGE_BUCKET"

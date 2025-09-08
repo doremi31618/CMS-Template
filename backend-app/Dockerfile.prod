@@ -1,0 +1,33 @@
+# Multi-stage build for production
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+
+# Install dumb-init and Cloud SQL Proxy dependencies
+RUN apk add --no-cache dumb-init
+
+# Copy built application
+COPY --from=builder /app/build ./
+COPY --from=deps /app/node_modules ./node_modules
+
+# Create non-root user
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 adonisjs
+USER adonisjs
+
+EXPOSE 3333
+
+# Use dumb-init for proper signal handling
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "bin/server.js"]

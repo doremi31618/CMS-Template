@@ -1,0 +1,19 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dumb-init for proper signal handling
+RUN apk add --no-cache dumb-init
+
+# Copy package files first for better caching
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Expose port
+EXPOSE 3333
+
+# Use dumb-init and start development server with HMR
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["npm", "run", "dev"]
